@@ -1,0 +1,50 @@
+// ═══════════════════════════════════════════════════════════════
+//  Genie
+//  Smart door relay — Telegram controlled
+//  Hardware : Adafruit HUZZAH32 ESP32 Feather
+//  Display  : SSD1306 OLED 128x32 via I2C
+//               SDA → GPIO 23  SCL → GPIO 22
+//               VCC → 3.3V     GND → GND
+//
+//  LEDs (GPIO → 220Ω → LED anode → GND)
+//    Green  : GPIO 13 — device power on
+//    Red    : GPIO 12 — error / fault
+//
+//  Relay    : GPIO 26 — active HIGH, 500 ms pulse
+//
+//  Trigger  : Telegram command "open <code>"
+//
+//  Versioning: Semantic Versioning 2.0.0 (semver.org)
+//    MAJOR — breaking changes (new config keys, behaviour change)
+//    MINOR — backwards-compatible new features
+//    PATCH — backwards-compatible bug fixes
+//
+//  Changelog:
+//    — loop() refactored: checkWiFi() moved inside active-hours
+//            gate so it cannot fire during sleep. Sleep and active
+//            modes are now structurally exclusive — no fall-through.
+//    — Fixed showScreen() body text invisible (BLACK on BLACK).
+//            setTextColor now explicitly sets WHITE on BLACK after
+//            status bar. connectWiFi() showWiFiLost() guarded with
+//            wasSleeping. setup() no longer calls showIdle() —
+//            loop() decides the first screen based on active hours.
+//    - Sleep mode now exclusive: showSleeping() is the only
+//            screen rendered outside active hours. Telegram polling
+//            removed from sleep loop entirely. showIdle() and
+//            showPolling() cannot fire while sleeping.
+//    — isWithinActiveHours() simplified to midnight-wrap only.
+//            Added wrapsMidnight bool parameter (default true) for
+//            future same-day window support. static_assert in
+//            config.h enforces START > END at compile time.
+//    — Active hours sleep mode.
+//    — Watchdog timer, boot-reason reporting, sendAlert(),
+//            pending alert queue, WiFi reconnect counter with
+//            ESP.restart() failover, SemVer versioning,
+//            NTP time sync.
+//
+//  Libraries required:
+//    Adafruit SSD1306
+//    Adafruit GFX
+//    UniversalTelegramBot
+//    ArduinoJson 6.x  (NOT 7.x)
+// ═══════════════════════════════════════════════════════════════
