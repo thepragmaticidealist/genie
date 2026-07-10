@@ -1,9 +1,7 @@
-
-
 #define VERSION_MAJOR 2
 #define VERSION_MINOR 0
 #define VERSION_PATCH 0
-#define VERSION "2.0.0"
+#define VERSION       "2.0.0"
 
 // ── Includes ──────────────────────────────────────────────────
 #include <Wire.h>
@@ -30,12 +28,21 @@ WiFiClientSecure secured_client;
 UniversalTelegramBot bot(BOT_TOKEN, secured_client);
 
 // ── State flags ───────────────────────────────────────────────
-bool telegramReady        = false;
-bool relayRunning         = false;
-bool wifiWasLost          = false;
-bool testMode             = TEST_MODE_BOOT;
-bool timesynced           = false;
-bool wasSleeping          = false;
+bool telegramReady  = false;
+bool relayRunning   = false;
+bool wifiWasLost    = false;
+bool testMode       = TEST_MODE_BOOT;
+bool timesynced     = false;
+bool wasSleeping    = false;
+
+// ── Restart counter — RTC memory persists across warm reboots ─
+// Magic sentinel validates memory on boot. Without it, cold
+// power-on leaves garbage values in RTC memory.
+#define RTC_MAGIC 0xDEADBEEF
+
+RTC_DATA_ATTR uint32_t rtcMagic      = 0;
+RTC_DATA_ATTR int      restartCount  = 0;
+RTC_DATA_ATTR bool     faultSleeping = false;
 
 // ── Timers ────────────────────────────────────────────────────
 unsigned long lastReconnectAttempt = 0;
@@ -58,6 +65,30 @@ bool          redFlashState = false;
 #define ERROR_WIFI     "WIFI"
 #define ERROR_SETUP    "SETUP"
 #define ERROR_TELEGRAM "TELEGRAM"
+
+// ═══════════════════════════════════════════════════════════════
+//  RTC MEMORY
+// ═══════════════════════════════════════════════════════════════
+
+// ────────────────────────────────────────────────────────────
+// initRTCMemory()
+//   Validates RTC memory using a magic number sentinel.
+//   On first boot or cold power-on the sentinel won't match
+//   so all RTC values are initialised cleanly to zero.
+//   On wke up the sentinel matches
+//   and values are preserved as intended.
+//   Call at the very top of setup() before anything else.
+// ────────────────────────────────────────────────────────────
+void initRTCMemory() {
+  if (rtcMagic != RTC_MAGIC) {
+    Serial.println("RTC memory invalid — initialising.");
+    restartCount  = 0;
+    faultSleeping = false;
+    rtcMagic      = RTC_MAGIC;
+  } else {
+    Serial.println("RTC memory valid. Restart count: " + String(restartCount));
+  }
+}
 
 // ═══════════════════════════════════════════════════════════════
 //  WATCHDOG
@@ -113,7 +144,8 @@ void sendAlert(String message) {
     bot.sendMessage(ADMIN_CHAT_ID, "🔴 *Genie Alert*\n" + message, "Markdown");
     if (pendingAlert.length() > 0) {
       bot.sendMessage(ADMIN_CHAT_ID,
-        "📋 *Queued alert (sent when WiFi restored)*\n" + pendingAlert, "Markdown");
+        "📋 *Queued alert (sent when WiFi restored)*\n" + pendingAlert,
+        "Markdown");
       pendingAlert = "";
     }
   } else {
@@ -125,8 +157,11 @@ void sendAlert(String message) {
 void sendBootReport() {
   String reason = getResetReason();
   String msg = isAbnormalReset()
-    ? "⚠️ *Genie restarted* — v" + String(VERSION) + "\nReset reason: " + reason + "\nThis was an unplanned restart."
-    : "🟢 *Genie online* — v"    + String(VERSION) + "\nReset reason: " + reason;
+    ? "⚠️ *Genie restarted* — v" + String(VERSION) +
+      "\nReset reason: " + reason +
+      "\nThis was an unplanned restart."
+    : "🟢 *Genie online* — v" + String(VERSION) +
+      "\nReset reason: " + reason;
   bot.sendMessage(ADMIN_CHAT_ID, msg, "Markdown");
   Serial.println("Boot report sent: " + reason);
 }
@@ -158,7 +193,7 @@ void syncTime() {
 // isWithinActiveHours()
 //   wrapsMidnight = true  → active when h >= START or h < END
 //                           e.g. 18:00 → 08:00 (Phase 1 default)
-//   wrapsMidnight = false → active when h >= START and h < END 
+//   wrapsMidnight = false → active when h >= START and h < END
 //                           same-day window, reserved for future use
 //   Always returns true if testMode, NTP unsynced, or getLocalTime fails.
 // ────────────────────────────────────────────────────────────
@@ -168,14 +203,9 @@ bool isWithinActiveHours(bool wrapsMidnight = true) {
   struct tm ti;
   if (!getLocalTime(&ti)) return true;
   int h = ti.tm_hour;
-  bool isWithin = wrapsMidnight
+  return wrapsMidnight
     ? (h >= ACTIVE_HOUR_START || h < ACTIVE_HOUR_END)
     : (h >= ACTIVE_HOUR_START && h < ACTIVE_HOUR_END);
-
-    // Serial.print("Time is within active hrs");
-    // Serial.print(isWithin);
-
-    return isWithin;
 }
 
 String getCurrentTimeString() {
@@ -216,10 +246,9 @@ void updateLEDs() {
 
 void setErrorLED(bool state) {
   if (state) flashLED(LED_RED);
-  else  setLED(LED_RED, false);
+  else       setLED(LED_RED, false);
 }
 
-// ── Blocking pause — feeds watchdog and updates LEDs ──────────
 void blockingPause(unsigned long ms) {
   unsigned long start = millis();
   while (millis() - start < ms) { feedWatchdog(); updateLEDs(); delay(10); }
@@ -250,14 +279,12 @@ void activateRelay() {
 // ────────────────────────────────────────────────────────────
 // showScreen()
 //   Single entry point for all OLED writes.
-//   Draws the inverted status bar on row 0, then up to two
-//   body lines at rows 16 and 24.
+//   Status bar on row 0 (inverted), body lines at rows 16 / 24.
 //   Pass "" for line2 if only one body line is needed.
 // ────────────────────────────────────────────────────────────
 void showScreen(String statusState, String line1, String line2 = "") {
   display.clearDisplay();
 
-  // Status bar — row 0, inverted
   String bar = statusState;
   if (WiFi.status() == WL_CONNECTED) bar += " W+"; else bar += " W-";
   bar += telegramReady ? " TG+" : " TG-";
@@ -265,22 +292,13 @@ void showScreen(String statusState, String line1, String line2 = "") {
   while (bar.length() < 21) bar += " ";
   if (bar.length() > 21)    bar  = bar.substring(0, 21);
 
-  // TODO: Add countdown to telegram polling
-
   display.setCursor(0, 0);
   display.setTextColor(BLACK, WHITE);
   display.print(bar);
-  display.setTextColor(WHITE, BLACK);  // restore: white text on black background
+  display.setTextColor(WHITE, BLACK);
 
-  // Body lines
-  if (line1.length() > 0) {
-    display.setCursor(0, 16);
-    display.print(line1);
-  }
-  if (line2.length() > 0) {
-    display.setCursor(0, 24);
-    display.print(line2);
-  }
+  if (line1.length() > 0) { display.setCursor(0, 16); display.print(line1); }
+  if (line2.length() > 0) { display.setCursor(0, 24); display.print(line2); }
 
   display.display();
 }
@@ -291,19 +309,15 @@ void flashInvert() {
   display.invertDisplay(false);
 }
 
-// ── Named screen functions — thin wrappers around showScreen() ─
+// ── Named screen functions ────────────────────────────────────
 
 void showIdle() {
   showScreen("RLY:--", "Genie is ready", getCurrentTimeString() + " EAT");
 }
 
-void showNoMessages() {
-  showScreen("RLY:--", "No messages", "yet");
-}
-
 void showSleeping() {
   showScreen("ZZZ", "Sleeping",
-    "Now " + getCurrentTimeString()+ "  back " + String(ACTIVE_HOUR_START) + ":00");
+    "Now " + getCurrentTimeString() + "  back " + String(ACTIVE_HOUR_START) + ":00");
 }
 
 void showPolling() {
@@ -344,8 +358,10 @@ void showTestMode(String testLine) {
   showScreen("TEST", "TEST MODE ON", testLine);
 }
 
-void showRestarting() {
-  showScreen("RESTART", "Restarting...", "");
+void showFault() {
+  showScreen("FAULT",
+    "Restart cap reached",
+    "Retry in " + String(FAULT_SLEEP_MS / 60000) + " min");
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -373,6 +389,86 @@ void logError(const char* source, const char* code, const char* message) {
   Serial.println("[ERROR] " + msg);
   setErrorLED(true);
   sendAlert(msg);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MANAGED RESTART
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ────────────────────────────────────────────────────────────
+// managedRestart()
+//   Central restart handler. Call instead of ESP.restart()
+//   everywhere in the sketch.
+//
+//   Increments restartCount (RTC memory — survives warm reboots,
+//   clears on power-on). While under MAX_RESTARTS, queues an
+//   alert and restarts normally. On reaching the cap, enters a
+//   fault sleep loop: red LED blinks, OLED shows fault screen,
+//   device wakes every FAULT_SLEEP_MS and attempts one restart
+//   to check if the issue has resolved.
+//
+//   restartCount and faultSleeping are cleared in setup() after
+//   a confirmed clean boot (WiFi + Telegram both healthy).
+// ────────────────────────────────────────────────────────────
+void managedRestart(String reason) {
+  restartCount++;
+  Serial.print("Restart #"); Serial.print(restartCount);
+  Serial.print(" / ");       Serial.println(MAX_RESTARTS);
+  Serial.println("Reason: " + reason);
+
+  String alertMsg = "🔄 Restart #" + String(restartCount) +
+                    " of " + String(MAX_RESTARTS) +
+                    "\nReason: " + reason;
+
+  if (restartCount >= MAX_RESTARTS) {
+    faultSleeping = true;
+    alertMsg = "🛑 *Restart cap reached* (" + String(MAX_RESTARTS) +
+               " restarts)\nReason: " + reason +
+               "\nGenie is sleeping and will retry every " +
+               String(FAULT_SLEEP_MS / 60000) + " min.";
+
+    // Attempt to send before entering fault sleep
+    if (WiFi.status() == WL_CONNECTED && telegramReady) {
+      bot.sendMessage(ADMIN_CHAT_ID, alertMsg, "Markdown");
+    } else {
+      pendingAlert += (pendingAlert.length() == 0) ? alertMsg : "\n" + alertMsg;
+    }
+
+    Serial.println("Restart cap reached. Entering fault sleep loop.");
+
+    // Fault sleep loop — wake every FAULT_SLEEP_MS and retry once
+    while (true) {
+      setErrorLED(true);
+      showFault();
+
+      unsigned long faultStart = millis();
+      while (millis() - faultStart < FAULT_SLEEP_MS) {
+        feedWatchdog();
+        updateLEDs();
+        delay(500);
+      }
+
+      // Single retry — if clean boot succeeds setup() clears the counter
+      Serial.println("Fault sleep over — attempting restart.");
+
+      // Wake up instead of restart
+      esp_sleep_enable_timer_wakeup(FAULT_SLEEP_MS);
+      esp_deep_sleep_start();
+      // ESP.restart();
+    }
+  }
+
+  // Under the cap — queue alert and restart
+  if (WiFi.status() == WL_CONNECTED && telegramReady) {
+    bot.sendMessage(ADMIN_CHAT_ID, alertMsg, "Markdown");
+  } else {
+    pendingAlert += (pendingAlert.length() == 0) ? alertMsg : "\n" + alertMsg;
+  }
+
+  blockingPause(500);
+  // ESP.restart();
+  esp_sleep_enable_timer_wakeup(FAULT_SLEEP_MS);
+  esp_deep_sleep_start();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -405,11 +501,17 @@ bool connectWiFi() {
   Serial.println("\nConnected.");
   printWiFiStatus();
   setErrorLED(false);
-  telegramReady = true;
+  telegramReady     = true;
   reconnectAttempts = 0;
   return true;
 }
 
+// ────────────────────────────────────────────────────────────
+// checkWiFi()
+//   Called every loop() tick during active hours only.
+//   Detects drops and attempts reconnection up to
+//   MAX_RECONNECT_ATTEMPTS. On exhaustion calls managedRestart().
+// ────────────────────────────────────────────────────────────
 void checkWiFi() {
   if (WiFi.status() != WL_CONNECTED) {
     if (!wifiWasLost) {
@@ -418,7 +520,7 @@ void checkWiFi() {
       setErrorLED(true);
       Serial.println("WiFi lost.");
       sendAlert("📡 WiFi lost. Attempting reconnect.");
-      if (!wasSleeping) showWiFiLost();
+      showWiFiLost();
     }
     unsigned long now = millis();
     if (now - lastReconnectAttempt >= RECONNECT_MS) {
@@ -429,14 +531,8 @@ void checkWiFi() {
       Serial.print(" / ");
       Serial.println(MAX_RECONNECT_ATTEMPTS);
       if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-        Serial.println("Max reconnect attempts reached. Restarting...");
-        pendingAlert += "\n⚠️ WiFi reconnect failed after " +
-                        String(MAX_RECONNECT_ATTEMPTS) + " attempts. Restarting.";
-        showRestarting();
-        blockingPause(1000);
-        ESP.restart();
-
-        // TODO: Sleep if max restart attempts reached
+        managedRestart("WiFi reconnect failed after " +
+                       String(MAX_RECONNECT_ATTEMPTS) + " attempts.");
       }
       connectWiFi();
     }
@@ -447,11 +543,9 @@ void checkWiFi() {
     setErrorLED(false);
     Serial.println("WiFi restored.");
     sendAlert("✅ WiFi restored.");
-    if (!wasSleeping) {
-      showWiFiRestored();
-      blockingPause(RESTORED_PAUSE_MS);
-      showIdle();
-    }
+    showWiFiRestored();
+    blockingPause(RESTORED_PAUSE_MS);
+    showIdle();
   }
 }
 
@@ -465,11 +559,13 @@ void runSelfTest(String chatId) {
   Serial.println("=== SELF TEST START ===");
 
   String report = "🧪 *Genie Self-Test Report* — v" + String(VERSION) + "\n";
-  report += "Time: " + getCurrentTimeString() + " EAT\n\n";
+  report += "Time: " + getCurrentTimeString() + " EAT\n";
+  report += "Restart count: " + String(restartCount) + " / " +
+            String(MAX_RESTARTS) + "\n\n";
 
   // ── LEDs ──
-  int    ledPins[] = {LED_GREEN, LED_RED};
-  String ledNames[]= {"Green", "Red"};
+  int    ledPins[]  = {LED_GREEN, LED_RED};
+  String ledNames[] = {"Green", "Red"};
   report += "*LEDs*\n";
   for (int i = 0; i < 2; i++) {
     showTestMode(String("LED: ") + ledNames[i]);
@@ -478,7 +574,6 @@ void runSelfTest(String chatId) {
     report += "  " + ledNames[i] + ": ✅ OK\n";
     Serial.println("LED " + ledNames[i] + ": OK");
   }
-  // Restore green
   digitalWrite(LED_GREEN, HIGH);
 
   // ── Relay ──
@@ -494,18 +589,11 @@ void runSelfTest(String chatId) {
   showTestMode("WiFi...");
   report += "\n*WiFi*\n";
   bool wifiOk = (WiFi.status() == WL_CONNECTED);
-
-  // report += wifiOk
-  //   ? "  Status: ✅ Connected\n  SSID: " + String(WIFI_SSID) +
-  //     "\n  RSSI: " + String(WiFi.RSSI()) + " dBm\n  IP: " +
-  //     WiFi.localIP().toString() + "\n"
-  //   : "  Status: ❌ Not connected\n";
-
   report += wifiOk
     ? "  Status: ✅ Connected\n  SSID: " + String(WIFI_SSID) +
-      "\n  RSSI: " + String(WiFi.RSSI()) + " dBm\n  IP: " + "\n"
+      "\n  RSSI: " + String(WiFi.RSSI()) + " dBm\n  IP: " +
+      WiFi.localIP().toString() + "\n"
     : "  Status: ❌ Not connected\n";
-
   Serial.println("WiFi: " + String(wifiOk ? "OK" : "FAIL"));
   feedWatchdog();
 
@@ -531,7 +619,11 @@ void runSelfTest(String chatId) {
     ? "  Status: ✅ Within window\n"
     : "  Status: 💤 Outside window\n";
 
-  // ── Send report ──
+  // ── Restart counter ──
+  report += "\n*Restart counter*\n";
+  report += "  Count: " + String(restartCount) + " / " + String(MAX_RESTARTS) + "\n";
+  report += faultSleeping ? "  State: ⚠️ Fault sleeping\n" : "  State: ✅ Normal\n";
+
   bot.sendMessage(chatId, report, "Markdown");
   if (chatId != String(ADMIN_CHAT_ID)) {
     bot.sendMessage(ADMIN_CHAT_ID, report, "Markdown");
@@ -539,7 +631,6 @@ void runSelfTest(String chatId) {
   Serial.println("=== SELF TEST COMPLETE ===");
 
   testMode = savedTestMode;
-
   if (isWithinActiveHours(true)) showIdle();
   else                           showSleeping();
 }
@@ -609,8 +700,17 @@ void pollTelegram() {
   int messageCount = bot.getUpdates(bot.last_message_received + 1);
 
   if (messageCount == 0) {
-    showNoMessages();
+    showIdle();
     return;
+  }
+
+  if (messageCount > 0 && !telegramReady) {
+    telegramReady = true;
+    if (pendingAlert.length() > 0) {
+      bot.sendMessage(ADMIN_CHAT_ID,
+        "📋 *Queued alert*\n" + pendingAlert, "Markdown");
+      pendingAlert = "";
+    }
   }
 
   for (int i = 0; i < messageCount; i++) {
@@ -632,7 +732,6 @@ void pollTelegram() {
       continue;
     }
 
-    // ── Test mode trigger ──
     String textLower = text;
     textLower.toLowerCase(); textLower.trim();
     if (textLower == "start test") {
@@ -641,14 +740,12 @@ void pollTelegram() {
       continue;
     }
 
-    // ── Relay busy guard ──
     if (relayRunning) {
       bot.sendMessage(chatId, "Busy. Please wait.", "");
       showIdle();
       continue;
     }
 
-    // ── Parse and action ──
     bool valid = parseCommand(text, chatId);
     if (valid) {
       flashInvert();
@@ -670,6 +767,7 @@ void setup() {
   Serial.begin(9600);
   delay(500);
 
+  initRTCMemory();  // validate RTC memory before anything else
   initWatchdog();
   initLEDs();
   setLED(LED_GREEN, true);
@@ -677,6 +775,8 @@ void setup() {
   Serial.println("========================================");
   Serial.println("  Genie v" + String(VERSION));
   Serial.println("  Reset reason: " + getResetReason());
+  Serial.println("  Restart count: " + String(restartCount) +
+                 " / " + String(MAX_RESTARTS));
   Serial.println("========================================\n");
 
   initRelay();
@@ -687,8 +787,7 @@ void setup() {
   if (!connectWiFi()) {
     logError(ERROR_SETUP, "E04", "WiFi init failed at boot");
     showWiFiLost();
-    blockingPause(10000);
-    ESP.restart();
+    managedRestart("WiFi init failed at boot.");
   }
 
   secured_client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
@@ -703,9 +802,11 @@ void setup() {
     pendingAlert = "";
   }
 
-  Serial.println("\nAll systems ready. v" + String(VERSION));
-  // Don't call showIdle() here — loop() will immediately
-  // evaluate active hours and call the right screen.
+  // ── Confirmed clean boot — clear restart counter ──
+  restartCount  = 0;
+  faultSleeping = false;
+  Serial.println("Clean boot confirmed. Restart counter cleared.");
+  Serial.println("All systems ready. v" + String(VERSION));
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -715,7 +816,6 @@ void setup() {
 void loop() {
   feedWatchdog();
   updateLEDs();
-
 
   // ════════════════════════════════════════════════
   // SLEEP MODE — outside active hours
@@ -729,7 +829,6 @@ void loop() {
       setErrorLED(false);
     }
     showSleeping();
-    
     unsigned long sleepStart = millis();
     while (millis() - sleepStart < SLEEP_POLL_MS) {
       feedWatchdog();
@@ -742,7 +841,6 @@ void loop() {
   // ACTIVE MODE — only reached inside active hours
   // ════════════════════════════════════════════════
 
-  // First tick after waking from sleep
   if (wasSleeping) {
     wasSleeping  = false;
     lastPollTime = 0;
@@ -752,7 +850,6 @@ void loop() {
     showIdle();
   }
 
-  // WiFi watchdog — runs only during active hours
   checkWiFi();
 
   unsigned long now = millis();
@@ -766,6 +863,7 @@ void loop() {
     lastHeartbeat = now;
     Serial.println("Heartbeat: " + getCurrentTimeString() +
                    " | WiFi:" + String(WiFi.status() == WL_CONNECTED ? "+" : "-") +
-                   " | TG:"   + String(telegramReady ? "+" : "-"));
+                   " | TG:"   + String(telegramReady ? "+" : "-") +
+                   " | Restarts:" + String(restartCount));
   }
 }
