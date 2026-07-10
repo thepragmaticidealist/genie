@@ -1,50 +1,463 @@
-// ═══════════════════════════════════════════════════════════════
-//  Genie
-//  Smart door relay — Telegram controlled
-//  Hardware : Adafruit HUZZAH32 ESP32 Feather
-//  Display  : SSD1306 OLED 128x32 via I2C
-//               SDA → GPIO 23  SCL → GPIO 22
-//               VCC → 3.3V     GND → GND
-//
-//  LEDs (GPIO → 220Ω → LED anode → GND)
-//    Green  : GPIO 13 — device power on
-//    Red    : GPIO 12 — error / fault
-//
-//  Relay    : GPIO 26 — active HIGH, 500 ms pulse
-//
-//  Trigger  : Telegram command "open <code>"
-//
-//  Versioning: Semantic Versioning 2.0.0 (semver.org)
-//    MAJOR — breaking changes (new config keys, behaviour change)
-//    MINOR — backwards-compatible new features
-//    PATCH — backwards-compatible bug fixes
-//
-//  Changelog:
-//    — loop() refactored: checkWiFi() moved inside active-hours
-//            gate so it cannot fire during sleep. Sleep and active
-//            modes are now structurally exclusive — no fall-through.
-//    — Fixed showScreen() body text invisible (BLACK on BLACK).
-//            setTextColor now explicitly sets WHITE on BLACK after
-//            status bar. connectWiFi() showWiFiLost() guarded with
-//            wasSleeping. setup() no longer calls showIdle() —
-//            loop() decides the first screen based on active hours.
-//    - Sleep mode now exclusive: showSleeping() is the only
-//            screen rendered outside active hours. Telegram polling
-//            removed from sleep loop entirely. showIdle() and
-//            showPolling() cannot fire while sleeping.
-//    — isWithinActiveHours() simplified to midnight-wrap only.
-//            Added wrapsMidnight bool parameter (default true) for
-//            future same-day window support. static_assert in
-//            config.h enforces START > END at compile time.
-//    — Active hours sleep mode.
-//    — Watchdog timer, boot-reason reporting, sendAlert(),
-//            pending alert queue, WiFi reconnect counter with
-//            ESP.restart() failover, SemVer versioning,
-//            NTP time sync.
-//
-//  Libraries required:
-//    Adafruit SSD1306
-//    Adafruit GFX
-//    UniversalTelegramBot
-//    ArduinoJson 6.x  (NOT 7.x)
-// ═══════════════════════════════════════════════════════════════
+# Genie 🧞
+*A secure Telegram-controlled smart door relay built on the ESP32.*
+
+![Version](https://img.shields.io/badge/version-2.0.0-blue.svg)
+![Platform](https://img.shields.io/badge/platform-ESP32-green.svg)
+![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)
+
+---
+
+# Overview
+
+Genie is a lightweight, secure access controller that allows authorised users to remotely unlock an electric door or gate through Telegram.
+
+Unlike cloud-dependent smart lock systems, Genie is intentionally simple:
+
+- ESP32-based
+- Telegram Bot interface
+- Secure access code verification
+- OLED status display
+- Automatic health monitoring
+- Recovery from network failures
+- Low-power sleep outside operating hours
+- Designed for unattended, always-on operation
+
+The project was built to provide a reliable access control system suitable for homes, offices, apartment buildings, workshops and maker spaces.
+
+---
+
+# Features
+
+## Remote door control
+
+Unlock a relay by sending:
+
+```
+<string> <access_code>
+
+```
+
+Example:
+
+```
+sesame 483917
+```
+
+The relay is pulsed for **500 ms**, making Genie compatible with:
+
+- magnetic locks
+- strike locks
+- gate controllers
+- garage door trigger inputs
+- existing access control systems
+
+---
+
+## Telegram interface
+
+Genie communicates entirely through Telegram.
+
+Benefits include:
+
+- encrypted communication
+- no custom mobile app
+- multi-device support
+- instant notifications
+- simple deployment
+
+Only authorised Telegram users may interact with the device.
+
+---
+
+## OLED Status Display
+
+128×32 SSD1306 OLED provides live system information including:
+
+- boot screen
+- WiFi connection status
+- current time
+- device state
+- sleep mode
+- unlock confirmation
+- reboot reason
+- fault information
+
+---
+
+## LED Indicators
+
+| LED | Purpose |
+|------|----------|
+| 🟢 Green | Device powered and operating normally |
+| 🔴 Red | Fault condition or critical error |
+
+---
+
+## Intelligent Active Hours
+
+Genie only remains fully operational during configurable active hours.
+
+Outside those hours it:
+
+- disconnects unnecessary services
+- enters low-power sleep
+- wakes periodically
+- resumes automatically when active hours begin
+
+This dramatically reduces power consumption for installations that only require access during business hours.
+
+Midnight-spanning schedules (for example **18:00–06:00**) are fully supported.
+
+---
+
+## Automatic Health Monitoring
+
+Genie continuously monitors:
+
+- WiFi connection
+- Telegram connectivity
+- watchdog timer
+- system health
+- restart history
+
+Problems are automatically detected and recovered whenever possible.
+
+---
+
+## Automatic WiFi Recovery
+
+If WiFi drops:
+
+- reconnect attempts begin automatically
+- retry counters are maintained
+- administrators are notified after recovery
+- device operation resumes without intervention
+
+---
+
+## Watchdog Protection
+
+A hardware watchdog ensures the controller never hangs indefinitely.
+
+If firmware becomes unresponsive:
+
+- watchdog resets the ESP32
+- boot reason is recorded
+- administrator receives an alert
+- restart counter is updated
+
+---
+
+## Restart Protection
+
+Instead of calling `ESP.restart()` directly, Genie uses a restart manager that:
+
+- stores restart count in RTC memory
+- survives soft resets
+- prevents infinite reboot loops
+- enters safe fault mode after repeated failures
+
+---
+
+## Fault Mode
+
+If the restart threshold is exceeded Genie enters a protected fault state.
+
+During fault mode:
+
+- relay is disabled
+- red LED blinks
+- OLED displays fault information
+- device sleeps between retry attempts
+- administrator can investigate persistent issues
+
+This prevents continuous reboot cycles that could damage hardware or spam Telegram notifications.
+
+---
+
+## Boot Diagnostics
+
+Every startup records:
+
+- reset reason
+- boot source
+- restart count
+- firmware version
+
+These diagnostics help identify intermittent failures.
+
+---
+
+## Notification System
+
+Genie automatically sends Telegram alerts for important events including:
+
+- successful startup
+- watchdog reset
+- unexpected reboot
+- WiFi recovery
+- fault mode
+- wake from scheduled sleep
+
+If Telegram is temporarily unavailable, alerts are queued and delivered once connectivity returns.
+
+---
+
+# Hardware
+
+## Controller
+
+- Adafruit HUZZAH32 ESP32 Feather
+
+---
+
+## Display
+
+SSD1306 OLED (128×32)
+
+| Signal | ESP32 GPIO |
+|---------|------------|
+| SDA | GPIO 23 |
+| SCL | GPIO 22 |
+| VCC | 3.3 V |
+| GND | GND |
+
+---
+
+## LEDs
+
+Each LED should be connected through a **220 Ω resistor**.
+
+| LED | GPIO |
+|------|------|
+| Green | GPIO 13 |
+| Red | GPIO 12 |
+
+Configuration:
+
+```
+GPIO → 220 Ω resistor → LED anode
+LED cathode → GND
+```
+
+---
+
+## Relay
+
+| Signal | GPIO |
+|---------|------|
+| Relay | GPIO 26 |
+
+Operation:
+
+- Active HIGH
+- 500 ms pulse
+
+---
+
+# Software Requirements
+
+Required Arduino libraries:
+
+- Adafruit SSD1306
+- Adafruit GFX
+- UniversalTelegramBot
+- ArduinoJson 6.x (**Version 6 only**)
+
+> **Important:** ArduinoJson 7.x is **not supported**.
+
+---
+
+# Configuration
+
+Sensitive information should be stored in `config.h`.
+
+Typical configuration includes:
+
+```cpp
+WIFI_SSID
+WIFI_PASSWORD
+
+BOT_TOKEN
+
+ADMIN_CHAT_ID
+
+ACCESS_CODE
+
+ACTIVE_START_HOUR
+ACTIVE_END_HOUR
+
+MAX_RESTARTS
+
+FAULT_SLEEP_MS
+```
+
+Credentials should **never** be committed to version control.
+
+---
+
+# Command Reference
+
+## Unlock Door
+
+```
+<command> <access_code>
+```
+
+Example
+
+```
+sesame 483917
+```
+
+If the access code is valid:
+
+- relay activates
+- OLED confirms unlock
+- Telegram acknowledgement is returned
+
+---
+
+# Power Management
+
+During inactive hours Genie:
+
+- displays sleeping screen
+- reduces activity
+- conserves power
+- automatically resumes when active hours begin
+
+Administrators receive a wake notification when normal operation resumes.
+
+---
+
+# Reliability Features
+
+- Watchdog supervision
+- Managed restart handling
+- RTC restart persistence
+- Fault recovery mode
+- WiFi reconnect logic
+- Pending Telegram alerts
+- Boot diagnostics
+- Active-hours power management
+- Safe relay control
+- OLED status reporting
+
+---
+
+# Versioning
+
+Genie follows **Semantic Versioning 2.0.0**.
+
+```
+MAJOR.MINOR.PATCH
+```
+
+### MAJOR
+
+Breaking changes
+
+Examples:
+
+- configuration changes
+- protocol changes
+- behavioural changes
+
+---
+
+### MINOR
+
+New backwards-compatible functionality.
+
+Examples:
+
+- new OLED screens
+- new Telegram commands
+- improved diagnostics
+
+---
+
+### PATCH
+
+Bug fixes and reliability improvements.
+
+Examples:
+
+- display fixes
+- reconnect improvements
+- crash fixes
+
+---
+
+# Changelog
+
+## 2.2.0
+
+
+- Watchdog support
+- Boot reason reporting
+- Alert queue
+- WiFi reconnect counter
+- NTP synchronisation
+- Telegram alert framework
+- Added `managedRestart()`
+- RTC restart counter
+- Maximum restart protection
+- Fault sleep mode
+- Blinking fault LED
+- OLED fault screen
+- Replaced all `ESP.restart()` calls with deep sleep
+- RTC memory validated using sentinel
+- Prevents garbage restart counts after cold power-on
+- `initRTCMemory()` moved to the beginning of `setup()`
+- Introduced configurable active hours
+- Added administrator wake notifications
+- `checkWiFi()` now only runs during active hours
+- Sleep screen now exclusive outside active hours
+- Unified display rendering through `showScreen()`
+
+---
+
+# Future Improvements
+
+Potential enhancements include:
+
+- Multiple access codes
+- One-time PINs
+- Time-limited guest access
+- Audit logging
+- Web configuration portal
+- OTA firmware updates
+- Secure encrypted configuration storage
+- MQTT integration
+- Home Assistant integration
+
+---
+
+# Security Notes
+
+Genie is designed around a few core security principles:
+
+- Only authorised Telegram users can issue commands.
+- Access codes are validated before relay activation.
+- Secrets should never be committed to source control.
+- The relay remains inactive during fault conditions.
+- Automatic restart protection prevents uncontrolled reboot loops.
+- Status notifications help administrators detect abnormal behaviour quickly.
+
+For deployments in production, it is recommended to:
+- Store credentials securely.
+- Rotate access codes periodically.
+- Restrict physical access to the controller.
+- Keep firmware and dependencies up to date.
+
+---
+
+# License
+
+MIT License
+
+---
+
+Built with ❤️ using the ESP32 and Telegram Bot API.
