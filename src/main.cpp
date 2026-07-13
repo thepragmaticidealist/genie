@@ -753,6 +753,9 @@ void pollTelegram() {
       bot.sendMessage(chatId,
         "Your wish is my command " + sender + ". I shall open the door. 🧞", "");
       runActivation(chatId);
+
+      String doorOpenedAlert = String(sender  + " of chatId " + chatId + "has requested that I open the door.");
+      sendAlert(doorOpenedAlert);
     } else {
       showIdle();
     }
